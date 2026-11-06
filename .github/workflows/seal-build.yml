@@ -1,0 +1,77 @@
+name: Seal Build (spring-boot-actuator-autoconfigure)
+
+# Upstream builds on Concourse (ci/pipeline.yml -> ci/scripts/build-project.sh:
+# `./gradlew --no-daemon --max-workers=4 build publishAllPublicationsToDeploymentRepository`
+# on a Java 8 image with CI=true). This workflow mirrors that build, scoped to the
+# spring-boot-actuator-autoconfigure module and the actuator module it builds on.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test task + --tests selector to run instead of the full module suites"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build and test (Java 8, Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      GRADLE_ARGS: "-Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --no-scan --console=plain"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Install test result reporter (init script)
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/seal-test-results.gradle" <<'EOF'
+          allprojects {
+              tasks.withType(Test).configureEach { t ->
+                  t.outputs.upToDateWhen { false }
+                  t.outputs.cacheIf { false }
+                  t.filter.failOnNoMatchingTests = false
+                  t.testLogging {
+                      events "failed", "skipped"
+                      exceptionFormat "full"
+                  }
+                  t.afterTest { desc, result ->
+                      if (result.resultType == TestResult.ResultType.SKIPPED) {
+                          def reason = result.exception ? result.exception.message : "no reason reported by JUnit"
+                          println "SKIPPED TEST: ${desc.className}#${desc.name} (${t.path}) -- reason: ${reason}"
+                      } else if (result.resultType == TestResult.ResultType.FAILURE) {
+                          println "FAILED TEST: ${desc.className}#${desc.name} (${t.path})"
+                      }
+                  }
+                  t.afterSuite { desc, result ->
+                      if (desc.parent == null) {
+                          println "TEST SUMMARY ${t.path}: Tests: ${result.testCount} run, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped -- ${result.resultType}"
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build jar
+        run: ./gradlew $GRADLE_ARGS :spring-boot-project:spring-boot-actuator-autoconfigure:jar
+
+      - name: Test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew $GRADLE_ARGS ${{ inputs.test-filter }}
+          else
+            ./gradlew $GRADLE_ARGS :spring-boot-project:spring-boot-actuator:test :spring-boot-project:spring-boot-actuator-autoconfigure:test
+          fi
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-actuator-autoconfigure-jar
+          path: spring-boot-project/spring-boot-actuator-autoconfigure/build/libs/spring-boot-actuator-autoconfigure-2.3.6.RELEASE.jar
+          if-no-files-found: error
